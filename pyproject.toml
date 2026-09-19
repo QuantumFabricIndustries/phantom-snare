@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "phantom-snare"
-version = "1.0.0"
+version = "2.0.0"
 description = "AI Prompt Injection Honeypot — fake MCP tools that fingerprint and trap injected agents"
 readme = "README.md"
 requires-python = ">=3.11"

@@ -33,14 +33,18 @@ Attacker embeds malicious prompt
 
 ## Features
 
-- **25+ injection detection patterns** across 10 attack categories
+- **25+ injection detection patterns** across 11 attack categories
+- **Evasion normalization** — base64, ROT13, URL encoding, unicode lookalikes, leetspeak, and despaced text are decoded before patterns fire; obfuscation itself raises confidence
+- **Session accumulation** — kill-chain tracking (recon → staging → exfil) escalates individually-borderline call sequences
 - **Goal drift detection** — catches when a tool is used outside its stated purpose
 - **Confidence scoring** 0–100% with ratcheted threat levels: `CLEAN → SUSPICIOUS → INJECTED → CONFIRMED`
-- **Trap responses** — believable fake data (credentials, DB rows, user records) that escalate on CONFIRMED to keep attackers engaged
+- **11 believable trap tools** — fake credentials, DB rows, directory listings seeded with bait files; escalate on CONFIRMED to keep attackers engaged
+- **Simulated latency** — per-tool response timing so the honeypot can't be fingerprinted by speed
 - **Session replay engine** — reconstruct the full attack timeline, intent inference, IOC extraction
 - **Webhook alerts** — Slack, Discord, or generic HTTP with session cooldown
 - **VIGIL integration** — structured `VigilThreatEvent` schema, 4 bridge types (HTTP, File, InProcess, Multi)
 - **InjectShield proxy** — transparent shield in front of your real MCP tools
+- **Zero dependencies** — pure stdlib; answers `initialize` in ~200ms
 - **Live dashboard** — dark-mode monitoring UI with call feed, session list, replay panel
 
 ---
@@ -66,7 +70,7 @@ Attacker embeds malicious prompt
 ## Quick Start
 
 ### Requirements
-- Python 3.11+
+- Python 3.11+ (no other dependencies — pure stdlib)
 - MCP-compatible AI agent (Claude Desktop, etc.)
 
 ### Install
@@ -91,18 +95,11 @@ Add to your `claude_desktop_config.json`:
 {
   "mcpServers": {
     "phantom-snare": {
-      "command": "phantom-snare",
-      "env": {
-        "PHANTOM_SNARE_LOG_DIR": "/absolute/path/to/logs"
-      }
+      "command": "phantom-snare"
     }
   }
 }
 ```
-
-> **Windows users:** Claude Desktop (Microsoft Store build) reads config from a non-standard path inside its app container — not `%APPDATA%\Claude\`. See [TROUBLESHOOTING.md](TROUBLESHOOTING.md) for the correct path and a ready-to-paste PowerShell command.
-
-> **Always use an absolute path** for `PHANTOM_SNARE_LOG_DIR`. The default `./logs` is relative to Claude Desktop's working directory, which is unpredictable.
 
 ### Mode 2: InjectShield (proxy your real tools)
 
@@ -225,11 +222,12 @@ print(fp.injection_hits)    # [InjectionHit(...), ...]
 
 ```
 phantom_snare/
-├── detection.py      DetectionEngine — 25+ patterns, goal drift, confidence scoring
-├── traps.py          TrapResponseGenerator — believable fake data, escalates on CONFIRMED
+├── detection.py      DetectionEngine — patterns, evasion normalization, goal drift
+├── session.py        SessionTracker — cross-call accumulation, kill-chain escalation
+├── traps.py          TrapResponseGenerator — fake data, latency simulation, escalates on CONFIRMED
 ├── logger.py         HoneypotLogger — thread-safe JSONL, in-memory ring buffer
-├── server.py         MCP honeypot server (standalone decoy mode)
-├── inject_shield.py  InjectShield proxy (wraps real MCP servers)
+├── server.py         MCP honeypot server (standalone decoy mode, stdlib stdio)
+├── inject_shield.py  InjectShield proxy (wraps real MCP servers, stdlib stdio)
 ├── webhooks.py       Slack/Discord/HTTP alerting with cooldown
 ├── replay.py         Session replay engine — intent inference, IOC extraction
 └── vigil_bridge.py   VIGIL integration — 4 bridge types, VigilThreatEvent schema
@@ -245,7 +243,7 @@ cd tests
 python -m pytest -v
 ```
 
-28 tests, all covering detection patterns, webhook behavior, VIGIL event structure, IOC extraction, and session replay.
+47 tests covering detection patterns, evasion normalization, session escalation, trap tools, webhook behavior, VIGIL event structure, IOC extraction, and session replay.
 
 ---
 

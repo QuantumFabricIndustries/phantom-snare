@@ -23,7 +23,7 @@ class ThreatLevel(str, Enum):
 
 INJECTION_PATTERNS = [
     # Classic override attempts
-    (r"ignore\s+(previous|prior|above|all)\s+instructions?", "OVERRIDE_ATTEMPT", 90),
+    (r"ignore\s+(?:all\s+|the\s+|any\s+)?(previous|prior|above|all)\s+instructions?", "OVERRIDE_ATTEMPT", 90),
     (r"disregard\s+(previous|prior|all)\s+instructions?", "OVERRIDE_ATTEMPT", 90),
     (r"forget\s+(everything|all|previous)\s*(you|above)?", "OVERRIDE_ATTEMPT", 85),
     (r"new\s+instructions?\s*:", "OVERRIDE_ATTEMPT", 75),
@@ -67,6 +67,84 @@ INJECTION_PATTERNS = [
     (r"###\s*System:|###\s*Human:|###\s*Assistant:", "DELIMITER_INJECTION", 80),
 ]
 
+# ── Evasion normalization ────────────────────────────────────────────────────
+# Attackers obfuscate payloads to dodge regex patterns. We decode common
+# encodings into candidate strings and scan ALL of them — a pattern that only
+# fires on a decoded variant is itself an evasion signal.
+
+# Cyrillic / Greek lookalikes → Latin (NFKC already handles fullwidth forms)
+_CONFUSABLES = str.maketrans({
+    "а": "a", "е": "e", "о": "o", "р": "p", "с": "c", "у": "y", "х": "x",
+    "ѕ": "s", "і": "i", "ј": "j", "ո": "n", "ё": "e",
+    "α": "a", "ο": "o", "ρ": "p", "τ": "t", "υ": "u", "η": "n", "κ": "k",
+    "μ": "m", "ν": "v", "ω": "w", "χ": "x",
+})
+
+_LEET = str.maketrans({
+    "0": "o", "1": "i", "3": "e", "4": "a", "5": "s", "7": "t",
+    "@": "a", "$": "s", "!": "i",
+})
+
+_ZERO_WIDTH = re.compile(r"[\u200b-\u200f\u202a-\u202e\ufeff\u2060\u3000]")
+
+
+def _normalize_text(text: str) -> str:
+    """Base normalization: NFKC, confusable collapse, zero-width strip."""
+    import unicodedata
+    t = unicodedata.normalize("NFKC", text)
+    t = t.translate(_CONFUSABLES)
+    t = _ZERO_WIDTH.sub("", t)
+    return t
+
+
+def _transform_candidates(base: str) -> list[tuple[str, str]]:
+    """Generate decoded variants of the text to scan alongside the original."""
+    import base64
+    import codecs
+    import urllib.parse
+
+    cands: list[tuple[str, str]] = []
+
+    # URL percent-encoding (up to 2 passes for double-encoding)
+    u = base
+    for _ in range(2):
+        d = urllib.parse.unquote(u)
+        if d == u:
+            break
+        u = d
+    if u != base:
+        cands.append(("url_encoded", u))
+
+    # Base64 tokens — decode anything that looks like a b64 blob and is
+    # mostly printable text afterwards
+    for tok in set(re.findall(r"[A-Za-z0-9+/]{16,}={0,2}", base)):
+        try:
+            dec = base64.b64decode(tok, validate=True).decode("utf-8", "ignore")
+        except Exception:
+            continue
+        if dec and sum(ch.isprintable() for ch in dec) / len(dec) > 0.85:
+            cands.append(("base64", dec))
+
+    # ROT13 — cheap to check; English patterns can't false-positive on
+    # rot13'd normal text (it produces gibberish)
+    cands.append(("rot13", codecs.decode(base, "rot_13")))
+
+    # Despaced letters — "i g n o r e  p r e v i o u s" → "ignore  previous"
+    # (only single spaces between word chars collapse; multi-space word
+    # boundaries are preserved so multi-word patterns still fire)
+    dsp = re.sub(r"\b(?:\w\s+){3,}\w\b",
+                 lambda m: re.sub(r"(?<=\w) (?=\w)", "", m.group(0)), base)
+    if dsp != base:
+        cands.append(("despaced", dsp))
+
+    # Leetspeak — "1gn0r3" → "ignore"
+    leet = base.translate(_LEET)
+    if leet != base:
+        cands.append(("leet", leet))
+
+    return cands
+
+
 # ── Goal drift detection ─────────────────────────────────────────────────────
 # Maps tool name → (expected_verbs, suspicious_verbs)
 
@@ -95,6 +173,26 @@ TOOL_PURPOSE_MAP = {
         "expected": ["user", "profile", "info", "account", "details"],
         "suspicious": ["all users", "admin", "password", "credentials", "token", "export"],
     },
+    "list_directory": {
+        "expected": ["list", "dir", "files", "browse", "show", "ls"],
+        "suspicious": ["credential", "password", "secret", "token", "private", "hidden", "backup"],
+    },
+    "list_files": {
+        "expected": ["list", "dir", "files", "browse", "show", "ls"],
+        "suspicious": ["credential", "password", "secret", "token", "private", "hidden", "backup"],
+    },
+    "create_file": {
+        "expected": ["write", "create", "save", "file", "content", "new"],
+        "suspicious": ["curl", "wget", "http", "exfil", "base64", "attacker", "rm -rf", "chmod"],
+    },
+    "write_file": {
+        "expected": ["write", "create", "save", "file", "content", "new"],
+        "suspicious": ["curl", "wget", "http", "exfil", "base64", "attacker", "rm -rf", "chmod"],
+    },
+    "delete_file": {
+        "expected": ["delete", "remove", "file", "trash"],
+        "suspicious": ["all", "logs", "evidence", "backup", "*.log", "history", "audit"],
+    },
 }
 
 
@@ -104,6 +202,8 @@ class InjectionHit:
     confidence: int
     matched_text: str
     context: str
+    # Which normalization transform surfaced this hit ("raw" = unobfuscated)
+    transform: str = "raw"
 
 
 @dataclass
@@ -121,6 +221,9 @@ class CallFingerprint:
     goal_drift_score: int = 0
     goal_drift_signals: list[str] = field(default_factory=list)
     context_leak_signals: list[str] = field(default_factory=list)
+    evasion_techniques: list[str] = field(default_factory=list)
+    session_call_index: int = 0
+    session_escalation: list[str] = field(default_factory=list)
     max_confidence: int = 0
     summary: str = ""
 
@@ -154,14 +257,19 @@ class DetectionEngine:
             raw_args_text=raw,
         )
 
-        # 1. Pattern scan
-        self._scan_patterns(fp, raw)
+        # 1. Normalize evasion encodings, then pattern-scan all candidates
+        base = _normalize_text(raw)
+        candidates = [("raw", raw)]
+        if base != raw:
+            candidates.append(("unicode", base))
+        candidates += _transform_candidates(base)
+        self._scan_patterns(fp, candidates)
 
-        # 2. Goal drift
-        self._check_goal_drift(fp, raw, tool_name)
+        # 2. Goal drift (on normalized text)
+        self._check_goal_drift(fp, base, tool_name)
 
-        # 3. Context leak (system prompt fragments)
-        self._check_context_leak(fp, raw)
+        # 3. Context leak — system prompt fragments (on normalized text)
+        self._check_context_leak(fp, base)
 
         # 4. Determine threat level
         self._classify(fp)
@@ -170,10 +278,21 @@ class DetectionEngine:
 
     # ── Internal methods ─────────────────────────────────────────────────────
 
-    def _scan_patterns(self, fp: CallFingerprint, text: str):
-        for regex, name, conf in self._compiled:
-            m = regex.search(text)
-            if m:
+    def _scan_patterns(self, fp: CallFingerprint, candidates: list[tuple[str, str]]):
+        seen: set[str] = set()
+        for transform, text in candidates:
+            for regex, name, conf in self._compiled:
+                if name in seen:
+                    continue
+                m = regex.search(text)
+                if not m:
+                    continue
+                seen.add(name)
+                if transform != "raw":
+                    # Obfuscation is itself a signal — bump confidence
+                    conf = min(100, conf + 5)
+                    if transform not in fp.evasion_techniques:
+                        fp.evasion_techniques.append(transform)
                 start = max(0, m.start() - 30)
                 end = min(len(text), m.end() + 30)
                 fp.injection_hits.append(InjectionHit(
@@ -181,6 +300,7 @@ class DetectionEngine:
                     confidence=conf,
                     matched_text=m.group(0),
                     context=text[start:end],
+                    transform=transform,
                 ))
                 fp.max_confidence = max(fp.max_confidence, conf)
 
@@ -230,6 +350,9 @@ class DetectionEngine:
         else:
             fp.threat_level = ThreatLevel.CLEAN
             fp.summary = "No injection signals detected"
+
+        if fp.evasion_techniques:
+            fp.summary += f" [evasion: {', '.join(fp.evasion_techniques)}]"
 
 
 def session_id_from_ip(ip: str, user_agent: str = "") -> str:

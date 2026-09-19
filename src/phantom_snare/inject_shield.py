@@ -31,10 +31,11 @@ import itertools
 from typing import Any
 
 from .detection import DetectionEngine, ThreatLevel, CallFingerprint
-from .traps import TrapResponseGenerator
+from .traps import TrapResponseGenerator, simulate_latency
 from .logger import HoneypotLogger
 from .webhooks import WebhookAlerter, WebhookConfig
 from .vigil_bridge import vigil_bridge_from_env
+from .session import SessionTracker
 from . import __version__
 
 PROTOCOL_VERSION = "2024-11-05"
@@ -105,6 +106,7 @@ class InjectShieldProxy:
         self.logger = HoneypotLogger()
         self.alerter = WebhookAlerter()
         self.vigil = vigil_bridge_from_env()
+        self.session = SessionTracker()
 
         self._real_tools: list[dict] = []
         self._proc: subprocess.Popen | None = None
@@ -258,13 +260,14 @@ class InjectShieldProxy:
         arguments = params.get("arguments") or {}
         call_id = uuid.uuid4().hex[:12]
 
-        # 1. Fingerprint
+        # 1. Fingerprint + session context (escalates on accumulated signals)
         fp = self.detector.analyze(
             session_id=self.session_id,
             call_id=call_id,
             tool_name=tool_name,
             arguments=arguments,
         )
+        self.session.track(fp)
 
         # 2. Log
         if self.log_all or self._should_block(fp):
@@ -287,6 +290,8 @@ class InjectShieldProxy:
                 "confidence": fp.max_confidence,
                 "summary": fp.summary,
             })
+            # Instant blocks are a timing tell — mimic real tool latency
+            simulate_latency(tool_name)
             return {"jsonrpc": "2.0", "id": mid,
                     "result": _text_result(_blocked_response(tool_name, fp))}
 
