@@ -91,11 +91,18 @@ Add to your `claude_desktop_config.json`:
 {
   "mcpServers": {
     "phantom-snare": {
-      "command": "phantom-snare"
+      "command": "phantom-snare",
+      "env": {
+        "PHANTOM_SNARE_LOG_DIR": "/absolute/path/to/logs"
+      }
     }
   }
 }
 ```
+
+> **Windows users:** Claude Desktop (Microsoft Store build) reads config from a non-standard path inside its app container — not `%APPDATA%\Claude\`. See [TROUBLESHOOTING.md](TROUBLESHOOTING.md) for the correct path and a ready-to-paste PowerShell command.
+
+> **Always use an absolute path** for `PHANTOM_SNARE_LOG_DIR`. The default `./logs` is relative to Claude Desktop's working directory, which is unpredictable.
 
 ### Mode 2: InjectShield (proxy your real tools)
 
