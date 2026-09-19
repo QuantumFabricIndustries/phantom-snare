@@ -8,8 +8,6 @@ import os
 import json
 import time
 import threading
-import urllib.request
-import urllib.error
 from dataclasses import dataclass, field
 from typing import Callable
 from .detection import CallFingerprint, ThreatLevel
@@ -220,6 +218,8 @@ class WebhookAlerter:
             self._post(url, payload)
 
     def _post(self, url: str, payload: dict):
+        import urllib.request
+        import urllib.error
         try:
             data = json.dumps(payload).encode()
             req = urllib.request.Request(

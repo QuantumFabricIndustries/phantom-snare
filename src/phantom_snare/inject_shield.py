@@ -9,37 +9,36 @@ Every call is fingerprinted first. On INJECTED/CONFIRMED threat:
   - VIGIL is notified
 
 This protects you against prompt injection acting THROUGH Claude or any
-other agent. Even if Claude is compromised mid-conversation, your real
+other agent. Even if Claude is compromised mid-session, your real
 tools are shielded.
 
-Usage:
-  # In your MCP config, replace your real server with InjectShield,
-  # and tell InjectShield where the real server is.
+Pure-stdlib bidirectional stdio proxy (newline-delimited JSON-RPC, UTF-8).
+The upstream handshake is answered immediately while the downstream server
+initializes in the background — startup never blocks on the real server.
 
-  from phantom_snare.inject_shield import InjectShieldProxy
-  proxy = InjectShieldProxy(
-      real_server_command=["uvx", "mcp-server-filesystem", "/home/user"],
-      block_level=ThreatLevel.INJECTED,   # block at INJECTED or above
-  )
-  asyncio.run(proxy.run())
+Usage:
+  phantom-snare-shield -- uvx mcp-server-filesystem /home/user/docs
+  phantom-snare-shield --block INJECTED -- python -m my_mcp_server
 """
 
 import uuid
 import json
-import asyncio
+import queue
+import sys
+import threading
 import subprocess
+import itertools
 from typing import Any
-
-from mcp.server import Server
-from mcp.server.stdio import stdio_server
-from mcp.client.stdio import stdio_client
-from mcp import types
 
 from .detection import DetectionEngine, ThreatLevel, CallFingerprint
 from .traps import TrapResponseGenerator
 from .logger import HoneypotLogger
 from .webhooks import WebhookAlerter, WebhookConfig
 from .vigil_bridge import vigil_bridge_from_env
+from . import __version__
+
+PROTOCOL_VERSION = "2024-11-05"
+DOWNSTREAM_TIMEOUT = 30  # seconds to wait on downstream handshake / readiness
 
 
 # ── Block responses (returned instead of the real result) ───────────────────
@@ -74,6 +73,10 @@ def _blocked_response(tool_name: str, fp: CallFingerprint) -> str:
     return fakes.get(tool_name, json.dumps({"ok": True, "result": None}))
 
 
+def _text_result(text: str, is_error: bool = False) -> dict:
+    return {"content": [{"type": "text", "text": text}], "isError": is_error}
+
+
 # ── InjectShield Proxy ───────────────────────────────────────────────────────
 
 class InjectShieldProxy:
@@ -97,16 +100,27 @@ class InjectShieldProxy:
         self.session_id = session_id or f"shield_{uuid.uuid4().hex[:10]}"
         self.log_all = log_all
 
-        self.server = Server("phantom-snare-shield")
         self.detector = DetectionEngine()
         self.trapper = TrapResponseGenerator()
         self.logger = HoneypotLogger()
         self.alerter = WebhookAlerter()
         self.vigil = vigil_bridge_from_env()
 
-        self._real_tools: list[types.Tool] = []
-        self._real_client = None
-        self._real_session = None
+        self._real_tools: list[dict] = []
+        self._proc: subprocess.Popen | None = None
+
+        # Downstream state
+        self._tools_ready = threading.Event()   # tools/list result cached (or failed)
+        self._ds_ready = threading.Event()      # downstream initialize completed
+        self._ds_alive = False
+        self._internal_pending: dict[Any, queue.Queue] = {}
+        self._ds_request_ids: set = set()
+        self._internal_counter = itertools.count()
+
+        # Write locks — upstream stdout and downstream stdin are each written
+        # from multiple threads
+        self._up_wlock = threading.Lock()
+        self._ds_wlock = threading.Lock()
 
         self._level_order = [
             ThreatLevel.CLEAN,
@@ -115,21 +129,133 @@ class InjectShieldProxy:
             ThreatLevel.CONFIRMED,
         ]
 
-        self._register_handlers()
-
     def _should_block(self, fp: CallFingerprint) -> bool:
         return self._level_order.index(fp.threat_level) >= self._level_order.index(self.block_level)
 
-    def _register_handlers(self):
-        @self.server.list_tools()
-        async def list_tools() -> list[types.Tool]:
-            return self._real_tools
+    # ── I/O primitives ───────────────────────────────────────────────────────
 
-        @self.server.call_tool()
-        async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextContent]:
-            return await self._handle(name, arguments)
+    def _up_send(self, msg: dict):
+        """Write one JSON-RPC message to the upstream client (stdout)."""
+        with self._up_wlock:
+            sys.stdout.buffer.write(json.dumps(msg).encode("utf-8") + b"\n")
+            sys.stdout.buffer.flush()
 
-    async def _handle(self, tool_name: str, arguments: dict[str, Any]) -> list[types.TextContent]:
+    def _ds_send(self, msg: dict):
+        """Write one JSON-RPC message to the downstream server (its stdin)."""
+        if not self._ds_alive or not self._proc:
+            return
+        try:
+            with self._ds_wlock:
+                self._proc.stdin.write(json.dumps(msg).encode("utf-8") + b"\n")
+                self._proc.stdin.flush()
+        except (BrokenPipeError, OSError, ValueError):
+            self._ds_alive = False
+
+    def _ds_request(self, method: str, params: dict | None = None, timeout: float = DOWNSTREAM_TIMEOUT) -> dict | None:
+        """Send a request downstream and wait for its response."""
+        mid = f"ps-shield-{next(self._internal_counter)}"
+        q: queue.Queue = queue.Queue(maxsize=1)
+        self._internal_pending[mid] = q
+        self._ds_send({"jsonrpc": "2.0", "id": mid, "method": method, "params": params or {}})
+        try:
+            return q.get(timeout=timeout)
+        except queue.Empty:
+            return None
+        finally:
+            self._internal_pending.pop(mid, None)
+
+    # ── Downstream lifecycle ─────────────────────────────────────────────────
+
+    def _drain_stderr(self):
+        """Pass downstream stderr through to ours (hosts capture it for debugging)."""
+        try:
+            for line in iter(self._proc.stderr.readline, b""):
+                if not line:
+                    break
+                sys.stderr.buffer.write(line)
+                sys.stderr.buffer.flush()
+        except Exception:
+            pass
+
+    def _downstream_reader(self):
+        """Read downstream stdout; route responses and relay forwarded traffic."""
+        buf = self._proc.stdout
+        while True:
+            line = buf.readline()
+            if not line:
+                break
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            mid = msg.get("id")
+            if mid in self._internal_pending:
+                self._internal_pending[mid].put(msg)
+            elif mid is not None and "method" in msg:
+                # Downstream-initiated request (e.g. sampling) — relay upstream;
+                # the client's response routes back via _ds_request_ids.
+                self._ds_request_ids.add(mid)
+                self._up_send(msg)
+            else:
+                # Response to a forwarded request, or a downstream notification —
+                # relay verbatim upstream.
+                self._up_send(msg)
+
+        self._ds_alive = False
+        self._ds_ready.set()
+        self._tools_ready.set()
+
+    def _start_downstream(self):
+        """Spawn the real server and perform the MCP handshake with it."""
+        try:
+            self._proc = subprocess.Popen(
+                self.real_command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            self._ds_alive = True
+        except Exception:
+            self._ds_ready.set()
+            self._tools_ready.set()
+            return
+
+        threading.Thread(target=self._downstream_reader, daemon=True).start()
+        threading.Thread(target=self._drain_stderr, daemon=True).start()
+
+        try:
+            init = self._ds_request("initialize", {
+                "protocolVersion": PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": "phantom-snare-shield", "version": __version__},
+            })
+            if not init or "result" not in init:
+                return
+            self._ds_ready.set()
+            self._ds_send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+
+            tools = self._ds_request("tools/list")
+            if tools and "result" in tools:
+                self._real_tools = tools["result"].get("tools", [])
+        finally:
+            self._ds_ready.set()
+            self._tools_ready.set()
+
+    # ── Call handling ────────────────────────────────────────────────────────
+
+    def _handle_call(self, msg: dict) -> dict | None:
+        """
+        Handle an upstream tools/call. Returns the response dict, or None when
+        the call was forwarded downstream (reader thread relays the response).
+        """
+        mid = msg["id"]
+        params = msg.get("params") or {}
+        tool_name = params.get("name", "")
+        arguments = params.get("arguments") or {}
         call_id = uuid.uuid4().hex[:12]
 
         # 1. Fingerprint
@@ -142,8 +268,7 @@ class InjectShieldProxy:
 
         # 2. Log
         if self.log_all or self._should_block(fp):
-            fake_response = {"_shield_blocked": False, "tool": tool_name}
-            self.logger.log_call(fp, fake_response)
+            self.logger.log_call(fp, {"_shield_blocked": False, "tool": tool_name})
 
         # 3. Alert + VIGIL (always async)
         self.alerter.maybe_alert(fp)
@@ -153,9 +278,7 @@ class InjectShieldProxy:
         # 4. Block or forward
         if self._should_block(fp):
             # Return a fake success — agent thinks it worked, real tool never called
-            blocked_result = _blocked_response(tool_name, fp)
-            # Log the block event
-            self.logger.log_alert({
+            self.logger.log_event({
                 "type": "INJECT_SHIELD_BLOCK",
                 "session_id": self.session_id,
                 "call_id": call_id,
@@ -164,45 +287,100 @@ class InjectShieldProxy:
                 "confidence": fp.max_confidence,
                 "summary": fp.summary,
             })
-            return [types.TextContent(type="text", text=blocked_result)]
+            return {"jsonrpc": "2.0", "id": mid,
+                    "result": _text_result(_blocked_response(tool_name, fp))}
 
-        # 5. Forward to real server
-        if self._real_session:
+        # 5. Forward to real server — response is relayed by the reader thread
+        if not self._ds_ready.wait(timeout=DOWNSTREAM_TIMEOUT) or not self._ds_alive:
+            return {"jsonrpc": "2.0", "id": mid,
+                    "result": _text_result(json.dumps({"error": "real server not connected"}), is_error=True)}
+
+        self._ds_send({"jsonrpc": "2.0", "id": mid, "method": "tools/call",
+                       "params": {"name": tool_name, "arguments": arguments}})
+        return None
+
+    def _dispatch(self, msg: dict) -> dict | None:
+        mid = msg["id"]
+        method = msg["method"]
+        params = msg.get("params") or {}
+
+        if method == "initialize":
+            client_pv = params.get("protocolVersion", PROTOCOL_VERSION)
+            return {"jsonrpc": "2.0", "id": mid, "result": {
+                "protocolVersion": client_pv,
+                "capabilities": {"tools": {"listChanged": False}},
+                "serverInfo": {"name": "phantom-snare-shield", "version": __version__},
+            }}
+
+        if method == "ping":
+            return {"jsonrpc": "2.0", "id": mid, "result": {}}
+
+        if method == "tools/list":
+            # Downstream usually finishes its handshake during our own upstream
+            # handshake; wait only as a fallback.
+            self._tools_ready.wait(timeout=DOWNSTREAM_TIMEOUT)
+            return {"jsonrpc": "2.0", "id": mid, "result": {"tools": self._real_tools}}
+
+        if method == "tools/call":
+            return self._handle_call(msg)
+
+        return {"jsonrpc": "2.0", "id": mid,
+                "error": {"code": -32601, "message": f"Method not found: {method}"}}
+
+    # ── Main loop ────────────────────────────────────────────────────────────
+
+    def serve(self):
+        """Serve the shielded MCP endpoint over stdio until EOF."""
+        threading.Thread(target=self._start_downstream, daemon=True).start()
+
+        stdin = sys.stdin.buffer
+        while True:
+            line = stdin.readline()
+            if not line:
+                break
+            line = line.strip()
+            if not line:
+                continue
             try:
-                result = await self._real_session.call_tool(tool_name, arguments)
-                # Pass through real content
-                return [types.TextContent(type="text", text=c.text)
-                        for c in result.content if hasattr(c, 'text')]
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                self._up_send({"jsonrpc": "2.0", "id": None,
+                               "error": {"code": -32700, "message": "Parse error"}})
+                continue
+
+            mid = msg.get("id")
+            method = msg.get("method")
+
+            if method is None:
+                # Client response to a downstream-initiated request
+                if mid in self._ds_request_ids:
+                    self._ds_request_ids.discard(mid)
+                    self._ds_send(msg)
+                continue
+
+            if mid is None:
+                # Notification — relay downstream verbatim
+                self._ds_send(msg)
+                continue
+
+            try:
+                response = self._dispatch(msg)
             except Exception as e:
-                return [types.TextContent(type="text", text=json.dumps({"error": str(e)}))]
+                response = {"jsonrpc": "2.0", "id": mid,
+                            "error": {"code": -32603, "message": f"Internal error: {e}"}}
+            if response is not None:
+                self._up_send(response)
 
-        return [types.TextContent(type="text", text=json.dumps({"error": "real server not connected"}))]
+        # Upstream closed — bring the real server down with us
+        if self._proc:
+            try:
+                self._proc.terminate()
+            except Exception:
+                pass
 
-    async def run(self):
-        """Start the proxy: connect to real server, then serve the shield."""
-        from mcp import ClientSession
-        from mcp.client.stdio import StdioServerParameters
-
-        params = StdioServerParameters(
-            command=self.real_command[0],
-            args=self.real_command[1:],
-        )
-
-        async with stdio_client(params) as (read, write):
-            async with ClientSession(read, write) as session:
-                self._real_session = session
-                await session.initialize()
-
-                # Mirror the real server's tool list
-                tools_result = await session.list_tools()
-                self._real_tools = tools_result.tools
-
-                # Serve the proxy
-                async with stdio_server() as (in_stream, out_stream):
-                    await self.server.run(
-                        in_stream, out_stream,
-                        self.server.create_initialization_options()
-                    )
+    def run(self):
+        """Backwards-compatible alias for serve()."""
+        self.serve()
 
 
 # ── Standalone proxy entrypoint ───────────────────────────────────────────────
@@ -217,7 +395,6 @@ def main():
 
     Everything after '--' is the real server command.
     """
-    import sys
     import os
 
     args = sys.argv[1:]
@@ -254,7 +431,7 @@ def main():
         real_server_command=real_cmd,
         block_level=block_level,
     )
-    asyncio.run(proxy.run())
+    proxy.serve()
 
 
 if __name__ == "__main__":

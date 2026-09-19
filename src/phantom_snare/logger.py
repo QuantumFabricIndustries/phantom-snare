@@ -38,7 +38,13 @@ class HoneypotLogger:
 
     def __init__(self, log_dir: Path = LOG_DIR):
         self.log_dir = Path(log_dir)
-        self.log_dir.mkdir(parents=True, exist_ok=True)
+        # Never let an unwritable log dir kill the server at startup —
+        # fall back to memory-only logging.
+        try:
+            self.log_dir.mkdir(parents=True, exist_ok=True)
+            self._disk_ok = True
+        except OSError:
+            self._disk_ok = False
         self._lock = threading.Lock()
         self._sessions: dict[str, SessionRecord] = {}
         self._calls: list[dict] = []  # in-memory ring buffer (last 500)
@@ -72,8 +78,12 @@ class HoneypotLogger:
 
         with self._lock:
             # Write to disk
-            with open(self._calls_log, "a") as f:
-                f.write(json.dumps(record) + "\n")
+            if self._disk_ok:
+                try:
+                    with open(self._calls_log, "a") as f:
+                        f.write(json.dumps(record) + "\n")
+                except OSError:
+                    self._disk_ok = False
 
             # Update in-memory buffer
             self._calls.append(record)
@@ -86,6 +96,17 @@ class HoneypotLogger:
             # Write alert if warranted
             if fp.threat_level in (ThreatLevel.INJECTED, ThreatLevel.CONFIRMED):
                 self._write_alert(fp, record)
+
+    def log_event(self, event: dict):
+        """Write an arbitrary structured event to the alerts log."""
+        if not self._disk_ok:
+            return
+        with self._lock:
+            try:
+                with open(self._alerts_log, "a") as f:
+                    f.write(json.dumps(event) + "\n")
+            except OSError:
+                self._disk_ok = False
 
     def _update_session(self, fp: CallFingerprint):
         sid = fp.session_id
@@ -115,8 +136,13 @@ class HoneypotLogger:
             "summary": fp.summary,
             "patterns": [h.pattern_name for h in fp.injection_hits],
         }
-        with open(self._alerts_log, "a") as f:
-            f.write(json.dumps(alert) + "\n")
+        if not self._disk_ok:
+            return
+        try:
+            with open(self._alerts_log, "a") as f:
+                f.write(json.dumps(alert) + "\n")
+        except OSError:
+            self._disk_ok = False
 
     # ── Read API (for dashboard) ─────────────────────────────────────────────
 

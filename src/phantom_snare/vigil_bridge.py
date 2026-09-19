@@ -22,8 +22,6 @@ Integration modes:
 import json
 import time
 import threading
-import urllib.request
-import urllib.error
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Callable
@@ -165,6 +163,7 @@ class VigilHttpBridge(VigilBridgeBase):
         self.api_key = api_key
 
     def emit(self, event: VigilThreatEvent):
+        import urllib.request
         try:
             data = event.to_json().encode()
             headers = {"Content-Type": "application/json", "User-Agent": "PhantomSnare/1.0"}
@@ -256,7 +255,10 @@ def vigil_bridge_from_env() -> VigilBridgeBase | None:
     if url := os.environ.get("VIGIL_INGEST_URL"):
         bridges.append(VigilHttpBridge(url, os.environ.get("VIGIL_API_KEY", ""), min_level))
     if path := os.environ.get("VIGIL_QUEUE_PATH"):
-        bridges.append(VigilFileBridge(path, min_level))
+        try:
+            bridges.append(VigilFileBridge(path, min_level))
+        except OSError:
+            pass  # unwritable queue path must not kill startup
 
     if not bridges:
         return None

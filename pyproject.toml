@@ -8,9 +8,7 @@ version = "1.0.0"
 description = "AI Prompt Injection Honeypot — fake MCP tools that fingerprint and trap injected agents"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = [
-    "mcp>=1.0.0",
-]
+dependencies = []
 
 [project.optional-dependencies]
 dev = ["pytest", "pytest-asyncio"]
