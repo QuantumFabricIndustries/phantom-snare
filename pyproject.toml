@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "phantom-snare"
+version = "1.0.0"
+description = "AI Prompt Injection Honeypot — fake MCP tools that fingerprint and trap injected agents"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-asyncio"]
+
+[project.scripts]
+phantom-snare = "phantom_snare.server:main"
+phantom-snare-shield = "phantom_snare.inject_shield:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/phantom_snare"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

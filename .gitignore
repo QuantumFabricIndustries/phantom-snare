@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Logs (sensitive — never commit)
+*.jsonl
+logs/
+*.log
+
+# Environment / secrets
+.env
+.env.*
+*.env
+
+# VIGIL queue
+vigil-queue.jsonl
+vigil_queue.jsonl
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Distribution
+*.whl
+*.tar.gz

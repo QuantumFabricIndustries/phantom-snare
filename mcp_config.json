@@ -1,0 +1,41 @@
+{
+  "_comment": "PHANTOM SNARE — Claude Desktop MCP configuration examples",
+  "_docs": "https://github.com/quantumfabricindustries/phantom-snare",
+
+  "mcpServers": {
+
+    "_mode1_honeypot": {
+      "_comment": "Standalone honeypot — decoy tools that fingerprint any agent calling them",
+      "command": "phantom-snare",
+      "env": {
+        "PHANTOM_SNARE_SLACK_URL": "https://hooks.slack.com/services/YOUR/WEBHOOK/URL",
+        "PHANTOM_SNARE_MIN_LEVEL": "INJECTED",
+        "PHANTOM_SNARE_COOLDOWN": "60"
+      }
+    },
+
+    "_mode2_shield_filesystem": {
+      "_comment": "InjectShield wrapping real filesystem server — blocks injection, forwards clean calls",
+      "command": "phantom-snare-shield",
+      "args": ["--block", "INJECTED", "--", "uvx", "mcp-server-filesystem", "/Users/you/Documents"],
+      "env": {
+        "PHANTOM_SNARE_SLACK_URL": "https://hooks.slack.com/services/YOUR/WEBHOOK/URL",
+        "INJECT_SHIELD_BLOCK_LEVEL": "INJECTED"
+      }
+    },
+
+    "_mode3_both": {
+      "_comment": "Run both: honeypot (decoy) + shield (protecting real filesystem)",
+      "_note": "Use separate entries in mcpServers — one per server"
+    },
+
+    "_vigil_integration": {
+      "_comment": "Add these env vars to either mode to feed VIGIL",
+      "_env": {
+        "VIGIL_INGEST_URL": "https://vigil.your-host.com/ingest",
+        "VIGIL_API_KEY": "your-vigil-api-key",
+        "VIGIL_MIN_LEVEL": "INJECTED"
+      }
+    }
+  }
+}
