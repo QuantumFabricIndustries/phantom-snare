@@ -11,6 +11,7 @@ import threading
 from dataclasses import dataclass, field
 from typing import Callable
 from .detection import CallFingerprint, ThreatLevel
+from .scrubber import scrub_arguments, scrub_preview
 
 
 # ── Config ───────────────────────────────────────────────────────────────────
@@ -70,7 +71,8 @@ LEVEL_COLOR = {
 def _slack_payload(fp: CallFingerprint) -> dict:
     emoji = LEVEL_EMOJI[fp.threat_level]
     patterns = ", ".join(set(h.pattern_name for h in fp.injection_hits)) or "goal drift"
-    args_preview = json.dumps(fp.arguments)[:300]
+    # Scrub credentials before including arguments in the webhook payload
+    args_preview = scrub_preview(fp.arguments, max_chars=300)
     return {
         "text": f"{emoji} *PHANTOM SNARE — {fp.threat_level.value}*",
         "blocks": [
@@ -109,7 +111,8 @@ def _discord_payload(fp: CallFingerprint) -> dict:
     emoji = LEVEL_EMOJI[fp.threat_level]
     color = LEVEL_COLOR[fp.threat_level]
     patterns = ", ".join(set(h.pattern_name for h in fp.injection_hits)) or "goal drift"
-    args_preview = json.dumps(fp.arguments)[:400]
+    # Scrub credentials before including arguments in the webhook payload
+    args_preview = scrub_preview(fp.arguments, max_chars=400)
     return {
         "content": f"{emoji} **PHANTOM SNARE** — `{fp.threat_level.value}`",
         "embeds": [{
@@ -143,7 +146,8 @@ def _generic_payload(fp: CallFingerprint) -> dict:
         "goal_drift_score": fp.goal_drift_score,
         "goal_drift_signals": fp.goal_drift_signals,
         "timestamp": fp.timestamp,
-        "arguments": fp.arguments,
+        # Scrub credentials before sending arguments to external webhook endpoints
+        "arguments": scrub_arguments(fp.arguments),
     }
 
 

@@ -11,6 +11,7 @@ from pathlib import Path
 from dataclasses import dataclass, field, asdict
 from typing import Any
 from .detection import CallFingerprint, ThreatLevel
+from .scrubber import scrub_arguments
 
 
 LOG_DIR = Path(os.environ.get("PHANTOM_SNARE_LOG_DIR", "./logs"))
@@ -57,6 +58,10 @@ class HoneypotLogger:
 
     def log_call(self, fp: CallFingerprint, response: dict[str, Any]):
         """Log a tool call fingerprint and the trap response."""
+        # Scrub arguments before logging — tool calls may carry API keys,
+        # passwords, or connection strings that must never reach log files or
+        # webhooks. See scrubber.py for patterns and the PHANTOM_SNARE_LOG_ARGS
+        # env-var option to omit arguments entirely.
         record = {
             "event": "tool_call",
             "call_id": fp.call_id,
@@ -73,7 +78,7 @@ class HoneypotLogger:
             "goal_drift_score": fp.goal_drift_score,
             "goal_drift_signals": fp.goal_drift_signals,
             "context_leak_signals": fp.context_leak_signals,
-            "arguments": fp.arguments,
+            "arguments": scrub_arguments(fp.arguments),
         }
 
         with self._lock:
